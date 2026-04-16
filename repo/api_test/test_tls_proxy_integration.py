@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shlex
 import shutil
 import subprocess
 import time
@@ -35,14 +37,6 @@ def _compose_cmd() -> list[str] | None:
     if shutil.which("docker-compose") is not None:
         return ["docker-compose"]
     return None
-
-
-def _compose_project_name() -> str:
-    return os.environ.get("COMPOSE_PROJECT_NAME") or REPO_ROOT.name
-
-
-def _compose_network_name() -> str:
-    return f"{_compose_project_name()}_default"
 
 
 def _docker_available() -> bool:
@@ -88,30 +82,22 @@ def proxy_stack():
     # Wait until proxy can actually reach the api (a 401 status means
     # nginx → gunicorn → DRF view returned cleanly; a 502 means nginx
     # cannot yet reach the upstream worker).
-    network = _compose_network_name()
     deadline = time.time() + 180
-    last_out = ""
+    last_out = "proxy not ready"
     while time.time() < deadline:
-        r = subprocess.run(
+        r = _run_proxy_curl(
             [
-                "docker",
-                "run",
-                "--rm",
-                "--network",
-                network,
-                "curlimages/curl:8.10.1",
                 "-sk",
                 "-o",
                 "/dev/null",
                 "-w",
                 "%{http_code}",
-                "https://proxy:443/api/v1/audit/logs",
-            ],
-            capture_output=True,
-            text=True,
+                "https://127.0.0.1:443/api/v1/audit/logs",
+            ]
         )
+        status = _status_from_http_trace(r.stdout)
         last_out = r.stdout + r.stderr
-        if last_out.strip() == "401":
+        if status == 401:
             break
         time.sleep(3)
     else:
@@ -134,55 +120,51 @@ def _run_in_proxy_network(cmd: str) -> subprocess.CompletedProcess:
     )
 
 
-def _run_curl_via_sidecar(url: str) -> str:
-    """Hit ``url`` from a curl sidecar container that joins the compose
-    network. Returns ``"<status>\\n<body>"``."""
-    network = _compose_network_name()
-    r = subprocess.run(
+def _status_from_http_trace(trace: str) -> int | None:
+    text = trace.strip()
+    if not text or not text.isdigit():
+        return None
+    return int(text)
+
+
+def _run_proxy_curl(args: list[str]) -> subprocess.CompletedProcess:
+    cmd = "apk add --no-cache curl >/dev/null 2>&1; curl " + " ".join(
+        shlex.quote(arg) for arg in args
+    )
+    r = _run_in_proxy_network(cmd)
+    return r
+
+
+def _https_get_via_proxy_exec(path: str) -> tuple[int | None, str, str]:
+    r = _run_proxy_curl(
         [
-            "docker",
-            "run",
-            "--rm",
-            "--network",
-            network,
-            "curlimages/curl:8.10.1",
             "-sk",
             "-o",
             "/dev/stdout",
             "-w",
             "\\n%{http_code}",
-            url,
-        ],
-        capture_output=True,
-        text=True,
+            f"https://127.0.0.1:443{path}",
+        ]
     )
-    return r.stdout
+    body, _, status = r.stdout.rpartition("\n")
+    trace = r.stdout + r.stderr
+    return _status_from_http_trace(status), body, trace
 
 
 def test_https_handshake_returns_401_envelope(proxy_stack):
-    out = _run_curl_via_sidecar("https://proxy:443/api/v1/audit/logs")
-    body, _, status = out.rpartition("\n")
-    assert status.strip() == "401", out
+    status, body, trace = _https_get_via_proxy_exec("/api/v1/audit/logs")
+    assert status == 401, trace
     payload = json.loads(body)
     assert payload["error"]["code"] == "unauthorized"
     assert payload["error"]["request_id"]
 
 
 def test_plain_http_redirects_to_https(proxy_stack):
-    network = _compose_network_name()
-    r = subprocess.run(
+    r = _run_proxy_curl(
         [
-            "docker",
-            "run",
-            "--rm",
-            "--network",
-            network,
-            "curlimages/curl:8.10.1",
             "-skI",
-            "http://proxy:80/api/v1/audit/logs",
-        ],
-        capture_output=True,
-        text=True,
+            "http://127.0.0.1:80/api/v1/audit/logs",
+        ]
     )
     out = r.stdout + r.stderr
     assert "301" in out, out
@@ -190,25 +172,15 @@ def test_plain_http_redirects_to_https(proxy_stack):
 
 
 def test_negotiated_tls_version_modern(proxy_stack):
-    # openssl ships in nginx:alpine, but not as `openssl` on PATH directly —
-    # the s_client helper is available, however. Run it inside the proxy
-    # container so we don't have to discover the compose network name.
-    compose = _compose_cmd() or ["docker", "compose"]
-    r = subprocess.run(
+    r = _run_proxy_curl(
         [
-            *compose,
-            "exec",
-            "-T",
-            "proxy",
-            "sh",
-            "-c",
-            "apk add --no-cache openssl >/dev/null 2>&1; "
-            "echo | openssl s_client -connect 127.0.0.1:443 -servername governanceiq.local "
-            "2>/dev/null | grep -E 'Protocol|Cipher'",
-        ],
-        cwd=str(REPO_ROOT),
-        capture_output=True,
-        text=True,
+            "-skv",
+            "https://127.0.0.1:443/api/v1/audit/logs",
+            "-o",
+            "/dev/null",
+        ]
     )
     out = r.stdout + r.stderr
-    assert "TLSv1.2" in out or "TLSv1.3" in out, out
+    match = re.search(r"(TLSv1\.[23])", out)
+    version = match.group(1) if match else ""
+    assert version in {"TLSv1.2", "TLSv1.3"}, version
