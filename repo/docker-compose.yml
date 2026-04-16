@@ -1,0 +1,138 @@
+services:
+  bootstrap:
+    image: repo-api
+    build:
+      context: .
+      dockerfile: Dockerfile
+    entrypoint: ["/app/docker/bootstrap.sh"]
+    command: []
+    environment:
+      DJANGO_SETTINGS_MODULE: governanceiq.settings
+      DJANGO_SECRET_KEY: bootstrap-only-not-used-for-runtime
+      DATA_ENCRYPTION_KEY: bootstrap-only-not-used-for-runtime
+      MYSQL_PASSWORD: bootstrap-only-not-used-for-runtime
+      RUNTIME_SECRETS_DIR: /run/runtime-secrets
+    volumes:
+      - runtime_secrets:/run/runtime-secrets
+
+  db:
+    image: repo-db
+    user: "0:0"
+    build:
+      context: .
+      dockerfile: docker/mysql/Dockerfile
+    environment:
+      MYSQL_DATABASE: governanceiq
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+    # Binary logging enabled for the PITR (point-in-time-recovery) contract:
+    # last 14 days of binlogs are retained (1209600 seconds).
+    command:
+      - mysqld
+      - --log-bin=mysql-bin
+      - --binlog-format=ROW
+      - --binlog-expire-logs-seconds=1209600
+      - --server-id=1
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "MYSQL_PWD=\"$$(cat /run/runtime-secrets/mysql_root_password)\" mysql -h 127.0.0.1 -uroot -e \"SELECT 1\" >/dev/null 2>&1",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - runtime_secrets:/run/runtime-secrets
+      - export_storage:/var/lib/governanceiq/exports
+      - backup_storage:/var/lib/governanceiq/backups
+
+  api:
+    image: repo-api
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+      db:
+        condition: service_healthy
+    environment:
+      DJANGO_DEBUG: "0"
+      DJANGO_ALLOWED_HOSTS: "localhost,127.0.0.1,api,proxy,governanceiq.local"
+      DJANGO_SECRET_KEY_FILE: /run/runtime-secrets/django_secret_key
+      DATA_ENCRYPTION_KEY_FILE: /run/runtime-secrets/data_encryption_key
+      MYSQL_HOST: db
+      MYSQL_PORT: "3306"
+      MYSQL_DATABASE: governanceiq
+      MYSQL_TEST_DATABASE: test_governanceiq
+      MYSQL_USER: governanceiq
+      MYSQL_PASSWORD_FILE: /run/runtime-secrets/mysql_user_password
+      MYSQL_ROOT_PASSWORD_FILE: /run/runtime-secrets/mysql_root_password
+      EXPORT_STORAGE_DIR: /var/lib/governanceiq/exports
+      BACKUP_STORAGE_DIR: /var/lib/governanceiq/backups
+      BACKUP_ENCRYPTION_KEY_FILE: /run/runtime-secrets/backup_encryption_key
+      TZ: UTC
+    expose:
+      - "8000"
+    volumes:
+      - runtime_secrets:/run/runtime-secrets
+      - export_storage:/var/lib/governanceiq/exports
+      - backup_storage:/var/lib/governanceiq/backups
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  scheduler:
+    image: repo-api
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+      db:
+        condition: service_healthy
+      api:
+        condition: service_started
+    environment:
+      DJANGO_SECRET_KEY_FILE: /run/runtime-secrets/django_secret_key
+      DATA_ENCRYPTION_KEY_FILE: /run/runtime-secrets/data_encryption_key
+      MYSQL_HOST: db
+      MYSQL_PORT: "3306"
+      MYSQL_DATABASE: governanceiq
+      MYSQL_USER: governanceiq
+      MYSQL_PASSWORD_FILE: /run/runtime-secrets/mysql_user_password
+      EXPORT_STORAGE_DIR: /var/lib/governanceiq/exports
+      BACKUP_STORAGE_DIR: /var/lib/governanceiq/backups
+      BACKUP_ENCRYPTION_KEY_FILE: /run/runtime-secrets/backup_encryption_key
+      SKIP_MIGRATE: "1"
+      TZ: UTC
+    volumes:
+      - runtime_secrets:/run/runtime-secrets
+      - export_storage:/var/lib/governanceiq/exports
+      - backup_storage:/var/lib/governanceiq/backups
+    command: ["python", "manage.py", "run_scheduler_loop", "--interval", "60"]
+
+  proxy:
+    image: repo-proxy
+    build:
+      context: .
+      dockerfile: docker/proxy/Dockerfile
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+      api:
+        condition: service_started
+    ports:
+      - "8443:443"
+    volumes:
+      - runtime_secrets:/run/runtime-secrets:ro
+
+volumes:
+  mysql_data:
+  runtime_secrets:
+  export_storage:
+  backup_storage:
