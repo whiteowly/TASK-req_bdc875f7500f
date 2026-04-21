@@ -1,6 +1,6 @@
 # GovernanceIQ — Education Data & Content Governance API
 
-**Project type: backend**
+**Project type: server**
 
 Backend-only Django REST Framework + MySQL service that centralizes
 institutional analytics and data/content governance operations for an
